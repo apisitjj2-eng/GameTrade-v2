@@ -19,7 +19,8 @@ CREATE TABLE IF NOT EXISTS users (
  password_hash TEXT NOT NULL,
  name TEXT NOT NULL,
  role TEXT NOT NULL DEFAULT 'buyer'
- CHECK(role IN ('buyer','seller','admin'))
+ CHECK(role IN ('buyer','seller','admin')),
+ balance INTEGER NOT NULL DEFAULT 0 CHECK(balance >= 0)
 );
 CREATE TABLE IF NOT EXISTS listings (
  id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -38,8 +39,30 @@ CREATE TABLE IF NOT EXISTS orders (
  buyer_id INTEGER NOT NULL REFERENCES users(id),
  seller_id INTEGER NOT NULL REFERENCES users(id),
  price INTEGER NOT NULL,
+ commission_rate INTEGER NOT NULL DEFAULT 7,
+ commission_amount INTEGER NOT NULL DEFAULT 0,
+ seller_net INTEGER NOT NULL DEFAULT 0,
+ payment_mode TEXT NOT NULL DEFAULT 'demo',
  status TEXT NOT NULL DEFAULT 'pending'
  CHECK(status IN ('pending','delivered','completed','disputed','cancelled')),
+ created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS premium_subscriptions (
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ user_id INTEGER NOT NULL UNIQUE REFERENCES users(id),
+ plan TEXT NOT NULL CHECK(plan IN ('monthly','yearly')),
+ status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','cancelled','expired')),
+ price INTEGER NOT NULL,
+ started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ expires_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS wallet_transactions (
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ user_id INTEGER NOT NULL REFERENCES users(id),
+ admin_id INTEGER NOT NULL REFERENCES users(id),
+ amount INTEGER NOT NULL,
+ balance_after INTEGER NOT NULL,
+ note TEXT NOT NULL,
  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS disputes (
@@ -52,6 +75,20 @@ CREATE TABLE IF NOT EXISTS disputes (
  resolution TEXT
 );
 `);
+
+// Backward-compatible schema updates for existing demo databases.
+try { db.exec("ALTER TABLE users ADD COLUMN balance INTEGER NOT NULL DEFAULT 0 CHECK(balance >= 0)"); } catch (e) { if (!String(e.message).includes("duplicate column name")) throw e; }
+for (const [column, definition] of [
+  ["commission_rate", "INTEGER NOT NULL DEFAULT 7"],
+  ["commission_amount", "INTEGER NOT NULL DEFAULT 0"],
+  ["seller_net", "INTEGER NOT NULL DEFAULT 0"],
+  ["payment_mode", "TEXT NOT NULL DEFAULT 'demo'"]
+]) {
+  try { db.exec(`ALTER TABLE orders ADD COLUMN ${column} ${definition}`); } catch (e) {
+    if (!String(e.message).includes("duplicate column name")) throw e;
+  }
+}
+db.exec("UPDATE orders SET commission_amount = CAST(ROUND(price * 0.07) AS INTEGER), seller_net = price - CAST(ROUND(price * 0.07) AS INTEGER) WHERE commission_amount = 0 AND seller_net = 0");
 
 app.use(express.json({limit:"20kb"}));
 app.use(session({
@@ -105,7 +142,57 @@ app.post("/api/login", wrap(async (req,res) => {
  req.session.user=publicUser(user);
  res.json({user:req.session.user});
 }));
+app.post("/api/admin/unlock", auth, wrap(async (req,res) => {
+ const adminEmail = String(process.env.ADMIN_EMAIL || "").trim().toLowerCase();
+ const adminPin = process.env.ADMIN_PIN;
+
+ if (!adminEmail || !adminPin)
+  return res.status(503).json({error:"เซิร์ฟเวอร์ยังไม่ได้ตั้งค่า Admin"});
+ if (String(req.user.email).toLowerCase() !== adminEmail)
+  return res.status(403).json({error:"บัญชีนี้ไม่ได้รับอนุญาตให้เป็นแอดมิน"});
+ if (typeof req.body.pin !== "string" || req.body.pin !== adminPin)
+  return res.status(401).json({error:"PIN ไม่ถูกต้อง"});
+
+ req.session.user = {...req.session.user, role:"admin"};
+ req.session.save(err => {
+  if (err) return res.status(500).json({error:"บันทึก Session ไม่สำเร็จ"});
+  res.json({user:req.session.user});
+ });
+}));
+
 app.post("/api/logout",(req,res)=>req.session.destroy(()=>res.json({ok:true})));
+
+// Premium is simulation-only: this endpoint never charges money.
+function premiumFor(userId) {
+ const sub = db.prepare("SELECT * FROM premium_subscriptions WHERE user_id=?").get(userId);
+ if (!sub) return {active:false, subscription:null};
+ if (sub.status === "active" && Date.parse(sub.expires_at.replace(" ","T")+"Z") <= Date.now()) {
+  db.prepare("UPDATE premium_subscriptions SET status='expired' WHERE user_id=?").run(userId);
+  sub.status = "expired";
+ }
+ return {active:sub.status === "active", subscription:sub};
+}
+app.get("/api/premium",auth,(req,res)=>res.json({mode:"DEMO_ONLY",...premiumFor(req.user.id)}));
+app.post("/api/premium/subscribe",auth,(req,res)=>{
+ const plan=req.body.plan;
+ const plans={monthly:{price:99,days:30},yearly:{price:999,days:365}};
+ if(!plans[plan]) return res.status(400).json({error:"กรุณาเลือกแพ็กเกจที่ถูกต้อง"});
+ const current=premiumFor(req.user.id);
+ if(current.active) return res.status(409).json({error:"บัญชีนี้มี Premium ทดลองที่ยังใช้งานอยู่แล้ว"});
+ const {price,days}=plans[plan];
+ const now=new Date(),expires=new Date(now.getTime()+days*86400000);
+ const sqlDate=d=>d.toISOString().slice(0,19).replace("T"," ");
+ db.prepare(`INSERT INTO premium_subscriptions(user_id,plan,status,price,started_at,expires_at)
+ VALUES(?,?,'active',?,?,?) ON CONFLICT(user_id) DO UPDATE SET plan=excluded.plan,status='active',price=excluded.price,started_at=excluded.started_at,expires_at=excluded.expires_at`)
+ .run(req.user.id,plan,price,sqlDate(now),sqlDate(expires));
+ res.status(201).json({mode:"DEMO_ONLY",...premiumFor(req.user.id),message:"เปิด Premium ทดลองแล้ว ไม่มีการเรียกเก็บเงินจริง"});
+});
+app.post("/api/premium/cancel",auth,(req,res)=>{
+ const sub=premiumFor(req.user.id);
+ if(!sub.active) return res.status(409).json({error:"ไม่มี Premium ที่กำลังใช้งาน"});
+ db.prepare("UPDATE premium_subscriptions SET status='cancelled' WHERE user_id=?").run(req.user.id);
+ res.json({mode:"DEMO_ONLY",...premiumFor(req.user.id),message:"ยกเลิก Premium ทดลองแล้ว"});
+});
 
 app.post("/api/role",auth,(req,res)=>{
  if (!["buyer","seller"].includes(req.body.role)) return res.status(400).json({error:"บทบาทไม่ถูกต้อง"});
@@ -148,8 +235,10 @@ app.post("/api/orders",auth,role("buyer"),(req,res)=>{
   const l=db.prepare("SELECT * FROM listings WHERE id=?").get(req.body.listingId);
   if(!l||l.status!=="active")throw new Error("รายการนี้ไม่พร้อมขายแล้ว");
   if(l.seller_id===req.user.id)throw new Error("ซื้อประกาศของตัวเองไม่ได้");
-  const result=db.prepare("INSERT INTO orders(listing_id,buyer_id,seller_id,price) VALUES(?,?,?,?)")
-   .run(l.id,req.user.id,l.seller_id,l.price);
+  const commission = Math.round(l.price * 0.07);
+  const sellerNet = l.price - commission;
+  const result=db.prepare("INSERT INTO orders(listing_id,buyer_id,seller_id,price,commission_rate,commission_amount,seller_net,payment_mode) VALUES(?,?,?,?,7,?,?,'demo')")
+   .run(l.id,req.user.id,l.seller_id,l.price,commission,sellerNet);
   db.prepare("UPDATE listings SET status='reserved' WHERE id=?").run(l.id);
   return Number(result.lastInsertRowid);
  });
@@ -191,6 +280,15 @@ app.post("/api/orders/:id/dispute",auth,(req,res)=>{
   tx();res.status(201).json({ok:true});
  } catch(e){res.status(409).json({error:"ข้อพิพาทนี้อาจมีอยู่แล้ว"});}
 });
+app.get("/api/admin/commission-summary",auth,role("admin"),(req,res)=>{
+ const summary=db.prepare(`SELECT COUNT(*) AS order_count,
+ COALESCE(SUM(CASE WHEN status='completed' THEN price ELSE 0 END),0) AS completed_gross,
+ COALESCE(SUM(CASE WHEN status='completed' THEN commission_amount ELSE 0 END),0) AS completed_commission,
+ COALESCE(SUM(CASE WHEN status IN ('pending','delivered','disputed') THEN commission_amount ELSE 0 END),0) AS pending_commission,
+ COALESCE(SUM(CASE WHEN status='completed' THEN seller_net ELSE 0 END),0) AS completed_seller_net
+ FROM orders WHERE payment_mode='demo'`).get();
+ res.json({mode:"DEMO_ONLY",summary});
+});
 app.get("/api/admin/disputes",auth,role("admin"),(req,res)=>{
  res.json({disputes:db.prepare("SELECT d.*,o.status order_status FROM disputes d JOIN orders o ON o.id=d.order_id ORDER BY d.id DESC").all()});
 });
@@ -210,7 +308,45 @@ app.post("/api/admin/disputes/:id/resolve",auth,role("admin"),(req,res)=>{
 });
 
 app.get("/api/admin/users",auth,role("admin"),(req,res)=>{
- res.json({users:db.prepare("SELECT id,email,name,role FROM users ORDER BY id DESC LIMIT 200").all()});
+ res.json({users:db.prepare("SELECT id,email,name,role,balance FROM users ORDER BY id DESC LIMIT 200").all()});
+});
+// All wallet changes are simulated and only an authenticated admin can perform them.
+app.post("/api/admin/users/:id/balance",auth,role("admin"),(req,res)=>{
+ const userId=Number(req.params.id), amount=Number(req.body.amount), action=req.body.action;
+ const note=str(req.body.note||"ปรับยอดโดยแอดมิน",200)?(req.body.note||"ปรับยอดโดยแอดมิน").trim():"ปรับยอดโดยแอดมิน";
+ if(!Number.isSafeInteger(userId)||userId<1||!Number.isSafeInteger(amount)||amount<0||amount>1000000000||!['add','subtract','set'].includes(action)) return res.status(400).json({error:"กรุณาตรวจสอบบัญชี จำนวนเงิน และรูปแบบการปรับยอด"});
+ const target=db.prepare("SELECT id,role,balance FROM users WHERE id=?").get(userId);
+ if(!target)return res.status(404).json({error:"ไม่พบบัญชีผู้ใช้"});
+ if(target.role==='admin' && target.id===req.user.id)return res.status(400).json({error:"ไม่สามารถปรับยอดบัญชีแอดมินที่กำลังใช้งานได้"});
+ let next=action==='add'?target.balance+amount:action==='subtract'?target.balance-amount:amount;
+ if(!Number.isSafeInteger(next)||next<0||next>1000000000)return res.status(400).json({error:"ยอดเงินต้องอยู่ระหว่าง 0 ถึง 1,000,000,000 บาทจำลอง"});
+ const delta=next-target.balance;
+ const tx=db.transaction(()=>{db.prepare("UPDATE users SET balance=? WHERE id=?").run(next,userId);db.prepare("INSERT INTO wallet_transactions(user_id,admin_id,amount,balance_after,note) VALUES(?,?,?,?,?)").run(userId,req.user.id,delta,next,note);});
+ tx();res.json({ok:true,balance:next,message:`ปรับยอดจำลองแล้ว ยอดคงเหลือ ${next} บาท`});
+});
+app.get("/api/admin/wallet-transactions",auth,role("admin"),(req,res)=>{
+ res.json({transactions:db.prepare(`SELECT t.*,u.name AS user_name,u.email AS user_email,a.name AS admin_name FROM wallet_transactions t JOIN users u ON u.id=t.user_id JOIN users a ON a.id=t.admin_id ORDER BY t.id DESC LIMIT 100`).all()});
+});
+app.post("/api/admin/users/:id/role",auth,role("admin"),(req,res)=>{
+ const id=Number(req.params.id), roleName=req.body.role;
+ if(!Number.isSafeInteger(id)||!['buyer','seller'].includes(roleName))return res.status(400).json({error:"ข้อมูลบทบาทไม่ถูกต้อง"});
+ const target=db.prepare("SELECT id,role FROM users WHERE id=?").get(id);
+ if(!target)return res.status(404).json({error:"ไม่พบบัญชีผู้ใช้"});
+ if(target.role==='admin')return res.status(400).json({error:"ไม่สามารถเปลี่ยนบทบาทแอดมินผ่านเมนูนี้ได้"});
+ db.prepare("UPDATE users SET role=? WHERE id=?").run(roleName,id);res.json({ok:true});
+});
+app.post("/api/admin/listings/:id/remove",auth,role("admin"),(req,res)=>{
+ const id=Number(req.params.id);if(!Number.isSafeInteger(id)||id<1)return res.status(400).json({error:"รหัสประกาศไม่ถูกต้อง"});
+ const r=db.prepare("UPDATE listings SET status='removed' WHERE id=? AND status!='removed'").run(id);
+ if(!r.changes)return res.status(404).json({error:"ไม่พบประกาศหรือถูกลบไปแล้ว"});res.json({ok:true});
+});
+app.post("/api/admin/users/:id/premium",auth,role("admin"),(req,res)=>{
+ const id=Number(req.params.id), action=req.body.action;
+ if(!Number.isSafeInteger(id)||id<1||!['grant','revoke'].includes(action))return res.status(400).json({error:"ข้อมูล Premium ไม่ถูกต้อง"});
+ const target=db.prepare("SELECT id FROM users WHERE id=?").get(id);if(!target)return res.status(404).json({error:"ไม่พบบัญชีผู้ใช้"});
+ if(action==='revoke'){db.prepare("UPDATE premium_subscriptions SET status='cancelled' WHERE user_id=? AND status='active'").run(id);return res.json({ok:true,message:"ปิด Premium ทดลองแล้ว"});}
+ const now=new Date(),end=new Date(now.getTime()+30*86400000),fmt=d=>d.toISOString().slice(0,19).replace('T',' ');
+ db.prepare(`INSERT INTO premium_subscriptions(user_id,plan,status,price,started_at,expires_at) VALUES(?,'monthly','active',0,?,?) ON CONFLICT(user_id) DO UPDATE SET plan='monthly',status='active',price=0,started_at=excluded.started_at,expires_at=excluded.expires_at`).run(id,fmt(now),fmt(end));res.json({ok:true,message:"เปิด Premium ทดลอง 30 วันแล้ว"});
 });
 app.use("/api",(req,res)=>res.status(404).json({error:"ไม่พบ API"}));
 app.use((err,req,res,next)=>{console.error(err);res.status(500).json({error:"เกิดข้อผิดพลาดในระบบ"});});
