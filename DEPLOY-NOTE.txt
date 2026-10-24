@@ -1,0 +1,17 @@
+GameTrade v2 — deployment notes
+
+This is a demo only. No real payments or escrow.
+
+Render settings:
+- Runtime: Node
+- Build command: npm install
+- Start command: npm start
+- Environment: NODE_ENV=production
+- Environment: SESSION_SECRET=<generate a long random secret>
+
+The server listens on process.env.PORT and 0.0.0.0 and enables secure cookies in production.
+
+IMPORTANT DATABASE LIMITATION:
+This version uses SQLite in the application folder. Render's free web service filesystem is ephemeral, so data can be lost when the service restarts/redeploys. Use only disposable test data until SQLite is moved to persistent storage or the app is migrated to PostgreSQL. The default in-memory session store is also demo-only and not suitable for production.
+
+Before inviting friends, deploy as a private experiment, use fake/test data only, and do not collect sensitive information.

@@ -1,0 +1,6 @@
+node_modules/
+gametrade.db
+gametrade.db-shm
+gametrade.db-wal
+.env
+.DS_Store

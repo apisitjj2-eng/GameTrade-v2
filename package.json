@@ -1,0 +1,13 @@
+{
+  "name": "gametrade-local",
+  "version": "1.0.0",
+  "private": true,
+  "description": "GameTrade local demo",
+  "scripts": { "start": "node server.js" },
+  "dependencies": {
+    "bcryptjs": "^3.0.2",
+    "better-sqlite3": "^11.8.1",
+    "express": "^5.1.0",
+    "express-session": "^1.18.1"
+  }
+}
